@@ -82,36 +82,32 @@ ZXY_FULL_PROMPT = """
 def get_client():
     return genai.Client(api_key=API_KEY)
 
-def load_knowledge_base():
-    """多平台路径适配加载"""
+# 使用缓存装饰器：设置 TTL 为 24 小时，且不显示加载转圈（由我们手动控制 UI）
+@st.cache_resource(show_spinner=False, ttl=86400)
+def load_knowledge_base_cached():
+    """
+    持久化缓存：资料只会在第一次部署或 24 小时后重新上传一次。
+    """
     client = get_client()
-    
-    # 获取当前执行脚本的绝对路径，定位到根目录下的 knowledge_base
     base_path = os.path.dirname(os.path.abspath(__file__))
     kb_dir = os.path.join(base_path, "knowledge_base")
     
     if not os.path.exists(kb_dir):
         return [], []
 
-    # 扫描所有文件 (PDF, MP3, TXT 等)
-    files = glob.glob(os.path.join(kb_dir, "*"))
+    # 扫描实际文件
+    files = [f for f in glob.glob(os.path.join(kb_dir, "*")) if os.path.isfile(f)]
     uploaded_parts = []
     file_names = []
 
     for f_path in files:
         try:
-            # 自动识别 MIME 类型
             ext = os.path.splitext(f_path)[1].lower()
-            mime_map = {
-                ".pdf": "application/pdf",
-                ".mp3": "audio/mpeg",
-                ".wav": "audio/wav",
-                ".txt": "text/plain",
-                ".csv": "text/csv"
-            }
+            mime_map = {".pdf": "application/pdf", ".mp3": "audio/mpeg", ".txt": "text/plain"}
             mime = mime_map.get(ext, "application/octet-stream")
             
             with open(f_path, "rb") as f:
+                # 文件上传到 Google 临时存储（有效期约 48 小时）
                 up_file = client.files.upload(file=f, config={'mime_type': mime})
             
             uploaded_parts.append(types.Part.from_uri(file_uri=up_file.uri, mime_type=up_file.mime_type))
@@ -120,35 +116,93 @@ def load_knowledge_base():
             continue
     return uploaded_parts, file_names
 
-# ================= 5. UI 与多格式上传逻辑 =================
+# ================= 5. UI 与对话逻辑 =================
 
 with st.sidebar:
     st.image("https://www.pbcsf.tsinghua.edu.cn/upload/images/2021/6/17152648602.jpg", width=120)
     st.title("张晓燕教授 Office Hour")
     
-    # 状态初始化
+    # 侧边栏按钮：允许手动强制刷新知识库（当你更新了 GitHub 资料时使用）
+    if st.button("🔄 强制同步 GitHub 资料"):
+        st.cache_resource.clear()
+        st.rerun()
+
+    # 执行加载
     if "kb_parts" not in st.session_state:
-        with st.spinner("📚 正在整理研究资料..."):
-            st.session_state.kb_parts, st.session_state.kb_names = load_knowledge_base()
+        with st.status("📚 教授正在读取研究卷宗...", expanded=False) as status:
+            parts, names = load_knowledge_base_cached()
+            st.session_state.kb_parts = parts
+            st.session_state.kb_names = names
+            status.update(label=f"✅ 已加载 {len(names)} 份资料", state="complete")
     
-    # 动态显示份数
     if st.session_state.kb_names:
-        st.success(f"已成功加载 {len(st.session_state.kb_names)} 份资料")
-        with st.expander("查看资料清单"):
+        st.success(f"已就绪 ({len(st.session_state.kb_names)} 份资料)")
+        with st.expander("查看当前清单"):
             for n in st.session_state.kb_names:
                 st.caption(f"· {n}")
-    else:
-        st.error("⚠️ 未能读取 knowledge_base 文件夹，请检查目录结构。")
 
     st.markdown("---")
-    
-    # 修正：允许上传多种文件格式 (图片, PDF, TXT)
-    st.markdown("### 📥 提交汇报素材")
-    uploaded_files = st.file_uploader(
-        "支持图片、PDF 或文档 (单文件 < 200MB)", 
-        type=["png", "jpg", "jpeg", "pdf", "txt", "csv"],
-        accept_multiple_files=True # 允许一次传多个
-    )
+    # 实时上传功能
+    st.markdown("### 📥 提交临时素材")
+    user_files = st.file_uploader("PDF/图片", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
 
-# --- 聊天记录展示与输入逻辑 (保留原版修复后的逻辑) ---
-# ... (此部分保持上一版 Part.from_text(text=...) 的写法)
+# 对话展示区
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# 固定对话框布局，防止资料加载后 UI 消失
+chat_container = st.container()
+
+with chat_container:
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"], avatar=("👨‍🎓" if m["role"]=="user" else "👩‍🏫")):
+            st.markdown(m["content"])
+
+# 输入处理
+if prompt := st.chat_input("说吧，你的模型又遇到什么问题了？"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with chat_container:
+        with st.chat_message("user", avatar="👨‍🎓"):
+            st.markdown(prompt)
+
+    with st.chat_message("assistant", avatar="👩‍🏫"):
+        placeholder = st.empty()
+        try:
+            client = get_client()
+            chat_contents = []
+
+            # 1. 注入持久化知识库
+            if st.session_state.kb_parts:
+                chat_contents.append(types.Content(role="user", parts=st.session_state.kb_parts + [types.Part.from_text(text="老师，这是知识库里的资料。")]))
+                chat_contents.append(types.Content(role="model", parts=[types.Part.from_text(text="好，直接入正题。")]))
+
+            # 2. 注入历史记录
+            for m in st.session_state.messages[:-1]:
+                chat_contents.append(types.Content(role=("model" if m["role"]=="assistant" else "user"), parts=[types.Part.from_text(text=m["content"])]))
+
+            # 3. 注入当前提问和新上传文件
+            curr_parts = [types.Part.from_text(text=prompt)]
+            if user_files:
+                for f in user_files:
+                    if f.type.startswith("image/"):
+                        curr_parts.append(Image.open(f))
+                    else:
+                        up = client.files.upload(file=f, config={'mime_type': f.type})
+                        curr_parts.append(types.Part.from_uri(file_uri=up.uri, mime_type=up.mime_type))
+            
+            chat_contents.append(types.Content(role="user", parts=curr_parts))
+
+            # 4. 获取响应
+            response = client.models.generate_content(
+                model=MODEL_ID,
+                contents=chat_contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=ZXY_FULL_PROMPT,
+                    temperature=0.7,
+                    tools=[types.Tool(google_search=types.GoogleSearch())]
+                )
+            )
+            placeholder.markdown(response.text)
+            st.session_state.messages.append({"role": "assistant", "content": response.text})
+        except Exception as e:
+            placeholder.error(f"（张教授皱了皱眉）连接异常：{e}")
