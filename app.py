@@ -14,7 +14,7 @@ st.set_page_config(
 
 # ================= 2. 核心配置 =================
 # 提示：请在 Streamlit Cloud 的 Secrets 中配置你的 API Key
-API_KEY = st.secrets.get("GOOGLE_API_KEY", "AIzaSyCJavjp0PKRiZtlZkEpBksVTGeSQ152EsM")
+API_KEY = st.secrets.get("GOOGLE_API_KEY")
 MODEL_ID = "gemini-3-flash-preview"
 
 # ================= 3. 终极系统提示词 (1:1 完整移植) =================
