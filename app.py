@@ -79,58 +79,78 @@ ZXY_FULL_PROMPT = """
 """
 
 # ================= 4. 核心功能引擎 =================
-
-@st.cache_resource
 def get_client():
     return genai.Client(api_key=API_KEY)
 
-@st.cache_resource
 def load_knowledge_base():
-    """读取知识库"""
+    """扫描并挂载 GitHub 仓库中的 knowledge_base 文件夹"""
     client = get_client()
     kb_dir = "knowledge_base"
-    if not os.path.exists(kb_dir): return [], []
-    files = glob.glob(os.path.join(kb_dir, "*"))
-    uploaded_parts, file_names = [], []
-    if not files: return [], []
     
-    msg = st.toast("📚 教授正在翻阅您的研究卷宗...")
+    if not os.path.exists(kb_dir):
+        return [], []
+
+    files = glob.glob(os.path.join(kb_dir, "*"))
+    uploaded_parts = []
+    file_names = []
+
+    if not files:
+        return [], []
+
     for f_path in files:
         try:
+            # 根据文件后缀设置 MIME 类型
             mime = "application/pdf"
             if f_path.endswith(".mp3"): mime = "audio/mpeg"
+            elif f_path.endswith(".txt"): mime = "text/plain"
+            
             with open(f_path, "rb") as f:
+                # 实时上传到 Gemini
                 up_file = client.files.upload(file=f, config={'mime_type': mime})
+            
             uploaded_parts.append(types.Part.from_uri(file_uri=up_file.uri, mime_type=up_file.mime_type))
             file_names.append(os.path.basename(f_path))
-        except: continue
+        except Exception:
+            continue
+            
     return uploaded_parts, file_names
 
-# ================= 5. UI 与交互 =================
+# ================= 5. UI 与交互逻辑 =================
 
+# 侧边栏：加载教授形象与知识库状态
 with st.sidebar:
     st.image("https://www.pbcsf.tsinghua.edu.cn/upload/images/2021/6/17152648602.jpg", width=120)
-    st.title("张晓燕教授 Office Hour")
+    st.title("张晓燕教授")
+    st.caption("Office Hour (Digital Twin V4.5)")
     st.markdown("---")
     
-    # 状态加载
+    # 每次运行重新加载，避免缓存报错
     if "kb_parts" not in st.session_state:
-        st.session_state.kb_parts, st.session_state.kb_names = load_knowledge_base()
+        with st.spinner("📚 教授正在翻阅您的研究卷宗..."):
+            kb_parts, kb_names = load_knowledge_base()
+            st.session_state.kb_parts = kb_parts
+            st.session_state.kb_names = kb_names
     
-    st.info(f"已加载 {len(st.session_state.kb_names)} 份实证资料")
-    st.markdown("### 📊 提交图表/作业")
-    uploaded_img = st.file_uploader("上传图片(K线图/公式)", type=["png", "jpg", "jpeg"])
+    if st.session_state.kb_names:
+        st.success(f"已加载 {len(st.session_state.kb_names)} 份研究资料")
+        with st.expander("查看资料清单"):
+            for name in st.session_state.kb_names:
+                st.caption(f"· {name}")
+    
+    st.markdown("---")
+    uploaded_img = st.file_uploader("📈 提交图表或作业", type=["png", "jpg", "jpeg"])
 
-# 聊天记录
+# 主界面：对话区
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-for m in st.session_state.messages:
-    with st.chat_message(m["role"], avatar=("👨‍🎓" if m["role"]=="user" else "👩‍🏫")):
-        st.markdown(m["content"])
+for msg in st.session_state.messages:
+    avatar = "👨‍🎓" if msg["role"] == "user" else "👩‍🏫"
+    with st.chat_message(msg["role"], avatar=avatar):
+        st.markdown(msg["content"])
 
-# 输入处理
-if prompt := st.chat_input("（你敲了敲门，走进了红楼办公室...）"):
+# 处理输入
+if prompt := st.chat_input("说吧，你的模型又遇到什么问题了？"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user", avatar="👨‍🎓"):
         st.markdown(prompt)
@@ -141,31 +161,42 @@ if prompt := st.chat_input("（你敲了敲门，走进了红楼办公室...）"
             client = get_client()
             chat_contents = []
 
-            # A. 背景知识
+            # 1. 注入知识库上下文
             if st.session_state.kb_parts:
-                chat_contents.append(types.Content(role="user", parts=st.session_state.kb_parts + [types.Part.from_text("老师，这是我提交的参考资料。")]))
-                chat_contents.append(types.Content(role="model", parts=[types.Part.from_text("我看过了，直接说核心逻辑。")]))
+                chat_contents.append(types.Content(
+                    role="user", 
+                    parts=st.session_state.kb_parts + [types.Part.from_text("老师，这是我提交的论文资料和音频素材。")]
+                ))
+                chat_contents.append(types.Content(
+                    role="model", 
+                    parts=[types.Part.from_text("资料收到了，我已经看过了。直接说你的观点。")]
+                ))
 
-            # B. 历史
-            for m in st.session_state.messages[:-1]:
-                chat_contents.append(types.Content(role=("model" if m["role"]=="assistant" else "user"), parts=[types.Part.from_text(m["content"])]))
+            # 2. 注入历史对话
+            for msg in st.session_state.messages[:-1]:
+                role = "model" if msg["role"] == "assistant" else "user"
+                chat_contents.append(types.Content(role=role, parts=[types.Part.from_text(msg["content"])]))
 
-            # C. 当前
-            curr_parts = [types.Part.from_text(prompt)]
-            if uploaded_img: curr_parts.append(Image.open(uploaded_img))
-            chat_contents.append(types.Content(role="user", parts=curr_parts))
+            # 3. 注入当前输入（含图片）
+            current_parts = [types.Part.from_text(prompt)]
+            if uploaded_img:
+                current_parts.append(Image.open(uploaded_img))
+            chat_contents.append(types.Content(role="user", parts=current_parts))
 
-            # D. 执行
-            response = client.models.generate_content(
-                model=MODEL_ID,
-                contents=chat_contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=ZXY_FULL_PROMPT,
-                    temperature=0.75,
-                    tools=[types.Tool(google_search=types.GoogleSearch())]
+            # 4. 调用模型
+            with st.spinner("张教授正在思考与联网检索..."):
+                response = client.models.generate_content(
+                    model=MODEL_ID,
+                    contents=chat_contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=ZXY_FULL_PROMPT,
+                        temperature=0.8,
+                        tools=[types.Tool(google_search=types.GoogleSearch())] # 开启联网
+                    )
                 )
-            )
+            
             placeholder.markdown(response.text)
             st.session_state.messages.append({"role": "assistant", "content": response.text})
+
         except Exception as e:
-            placeholder.error(f"（教授皱了皱眉）连接断了。错误：{e}")
+            placeholder.error(f"（张教授停了下来）连接出现异常：{str(e)}")
