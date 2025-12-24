@@ -83,73 +83,43 @@ def get_client():
     return genai.Client(api_key=API_KEY)
 
 def load_knowledge_base():
-    """扫描并挂载 GitHub 仓库中的 knowledge_base 文件夹"""
+    """扫描并挂载知识库文件"""
     client = get_client()
     kb_dir = "knowledge_base"
-    
-    if not os.path.exists(kb_dir):
-        return [], []
-
+    if not os.path.exists(kb_dir): return [], []
     files = glob.glob(os.path.join(kb_dir, "*"))
-    uploaded_parts = []
-    file_names = []
-
-    if not files:
-        return [], []
-
+    uploaded_parts, file_names = [], []
     for f_path in files:
         try:
-            # 根据文件后缀设置 MIME 类型
             mime = "application/pdf"
             if f_path.endswith(".mp3"): mime = "audio/mpeg"
             elif f_path.endswith(".txt"): mime = "text/plain"
-            
             with open(f_path, "rb") as f:
-                # 实时上传到 Gemini
                 up_file = client.files.upload(file=f, config={'mime_type': mime})
-            
+            # 使用 Part.from_uri 进行文件挂载
             uploaded_parts.append(types.Part.from_uri(file_uri=up_file.uri, mime_type=up_file.mime_type))
             file_names.append(os.path.basename(f_path))
-        except Exception:
-            continue
-            
+        except: continue
     return uploaded_parts, file_names
 
 # ================= 5. UI 与交互逻辑 =================
 
-# 侧边栏：加载教授形象与知识库状态
 with st.sidebar:
     st.image("https://www.pbcsf.tsinghua.edu.cn/upload/images/2021/6/17152648602.jpg", width=120)
-    st.title("张晓燕教授")
-    st.caption("Office Hour (Digital Twin V4.5)")
-    st.markdown("---")
-    
-    # 每次运行重新加载，避免缓存报错
+    st.title("张晓燕教授 Office Hour")
     if "kb_parts" not in st.session_state:
-        with st.spinner("📚 教授正在翻阅您的研究卷宗..."):
-            kb_parts, kb_names = load_knowledge_base()
-            st.session_state.kb_parts = kb_parts
-            st.session_state.kb_names = kb_names
-    
-    if st.session_state.kb_names:
-        st.success(f"已加载 {len(st.session_state.kb_names)} 份研究资料")
-        with st.expander("查看资料清单"):
-            for name in st.session_state.kb_names:
-                st.caption(f"· {name}")
-    
-    st.markdown("---")
-    uploaded_img = st.file_uploader("📈 提交图表或作业", type=["png", "jpg", "jpeg"])
+        with st.spinner("📚 正在整理研究资料..."):
+            st.session_state.kb_parts, st.session_state.kb_names = load_knowledge_base()
+    st.success(f"已加载 {len(st.session_state.kb_names)} 份资料")
+    uploaded_img = st.file_uploader("📈 提交图表", type=["png", "jpg", "jpeg"])
 
-# 主界面：对话区
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 for msg in st.session_state.messages:
-    avatar = "👨‍🎓" if msg["role"] == "user" else "👩‍🏫"
-    with st.chat_message(msg["role"], avatar=avatar):
+    with st.chat_message(msg["role"], avatar=("👨‍🎓" if msg["role"]=="user" else "👩‍🏫")):
         st.markdown(msg["content"])
 
-# 处理输入
 if prompt := st.chat_input("说吧，你的模型又遇到什么问题了？"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user", avatar="👨‍🎓"):
@@ -161,39 +131,33 @@ if prompt := st.chat_input("说吧，你的模型又遇到什么问题了？"):
             client = get_client()
             chat_contents = []
 
-            # 1. 注入知识库上下文
+            # A. 注入知识库 (修正 Part 调用)
             if st.session_state.kb_parts:
-                chat_contents.append(types.Content(
-                    role="user", 
-                    parts=st.session_state.kb_parts + [types.Part.from_text("老师，这是我提交的论文资料和音频素材。")]
-                ))
-                chat_contents.append(types.Content(
-                    role="model", 
-                    parts=[types.Part.from_text("资料收到了，我已经看过了。直接说你的观点。")]
-                ))
+                kb_intro = types.Part.from_text(text="老师，这是我提交的研究文献和录音。")
+                chat_contents.append(types.Content(role="user", parts=st.session_state.kb_parts + [kb_intro]))
+                chat_contents.append(types.Content(role="model", parts=[types.Part.from_text(text="我看过了。直接说你的想法。")]))
 
-            # 2. 注入历史对话
+            # B. 注入历史记录
             for msg in st.session_state.messages[:-1]:
                 role = "model" if msg["role"] == "assistant" else "user"
-                chat_contents.append(types.Content(role=role, parts=[types.Part.from_text(msg["content"])]))
+                chat_contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
 
-            # 3. 注入当前输入（含图片）
-            current_parts = [types.Part.from_text(prompt)]
+            # C. 注入当前提问
+            current_parts = [types.Part.from_text(text=prompt)]
             if uploaded_img:
                 current_parts.append(Image.open(uploaded_img))
             chat_contents.append(types.Content(role="user", parts=current_parts))
 
-            # 4. 调用模型
-            with st.spinner("张教授正在思考与联网检索..."):
-                response = client.models.generate_content(
-                    model=MODEL_ID,
-                    contents=chat_contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=ZXY_FULL_PROMPT,
-                        temperature=0.8,
-                        tools=[types.Tool(google_search=types.GoogleSearch())] # 开启联网
-                    )
+            # D. 发起请求 (开启联网搜索)
+            response = client.models.generate_content(
+                model=MODEL_ID,
+                contents=chat_contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=ZXY_FULL_PROMPT,
+                    temperature=0.7,
+                    tools=[types.Tool(google_search=types.GoogleSearch())]
                 )
+            )
             
             placeholder.markdown(response.text)
             st.session_state.messages.append({"role": "assistant", "content": response.text})
